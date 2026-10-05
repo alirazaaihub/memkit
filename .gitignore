@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# demo runtime memory
+demo_memory/
+
+# Virtual environments
+.venv
+
+# Secrets / local config — never commit
+.env
+.env.*
