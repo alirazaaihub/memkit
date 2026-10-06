@@ -158,7 +158,7 @@ name, so neither can be used to escape the memory folder.
 ## Install (uv)
 
 ```bash
-git clone <this repo> && cd claudee
+git clone https://github.com/alirazaaihub/memkit.git && cd claudee
 uv sync --extra openai --extra anthropic   # core needs only tiktoken; extras are for adapters
 uv run pytest -q                           # offline test suite, no keys needed
 ```
@@ -266,3 +266,6 @@ converts history internally — no call needed.)
   both.
 * LTM writes happen on one worker thread (the sole writer); `flush(timeout)`
   lets tests/diagnostics wait deterministically for queued work.
+
+
+Linkedin www.linkedin.com/in/alirazaaihub
