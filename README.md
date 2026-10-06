@@ -41,6 +41,14 @@ mem.close()                      # deterministic flush (atexit is wired too)
   slower than one summary call, so this is invisible). Need the window
   deterministically compacted? `mem.stm.wait_until_settled()` blocks until no
   compression is pending (used by tests and by `close()`).
+* **On-demand compaction: `compact()`.** The cap is a background policy, not a
+  restriction on you — `mem.compact(timeout)` summarizes right now, whether or
+  not the window is full, and returns once it settled. It is what a
+  user-facing `/compact` command calls (see `main.py`). Unlike a cap-driven
+  pass it ignores `keep_recent` and keeps only the newest turn verbatim, so a
+  summary always appears; a window already down to one turn is a no-op. The
+  folded text is still recoverable verbatim through `recall_transcript`, and
+  the archive feeds LTM extraction exactly as a cap-driven summary does.
 * The summarizer **first** appends the raw outgoing turns to the
   conversation's one transcript file, `stm/<session_id>.md` (`with open` +
   fsync — if the write fails, summarization is skipped, so text is never

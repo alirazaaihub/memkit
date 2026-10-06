@@ -438,3 +438,178 @@ def test_wait_until_settled_timeout(tmp_path):
 
     release.set()
     settle(stm)
+
+
+# -- forced compaction (/compact) -----------------------------------------------
+# The point: summarize NOW, even though the window is nowhere near the cap, so a
+# user can ask for a summary whenever they want one.
+
+def test_force_compact_summarizes_under_cap(tmp_path):
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\ncompacted"])
+    stm.add("user", "alpha")
+    stm.add("assistant", "beta")
+    stm.add("user", "gamma")
+    settle(stm)
+    assert stm.has_summary() is False and calls == [], "test is void — already over cap"
+
+    stm.force_compact()
+    settle(stm)
+    assert stm.has_summary(), "forced compaction did not summarize"
+    assert stm.summary == "## Chronology\ncompacted"
+    assert calls, "forced compaction never called the summarizer"
+
+
+def test_force_compact_keeps_only_the_newest_turn_verbatim(tmp_path):
+    """/compact ignores keep_recent: only the newest span stays verbatim, so a
+    summary is produced every time, however short the conversation is."""
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\ncompacted"])
+    for i in range(6):
+        stm.add("user", f"old {i}")
+    stm.add("user", "THE-LAST-TURN-MUST-SURVIVE")
+    settle(stm)
+
+    stm.force_compact()
+    settle(stm)
+    ctx = stm.context()
+    assert ctx[0]["role"] == "user" and "short-term memory" in ctx[0]["content"]
+    assert [m["content"] for m in ctx[1:]] == ["THE-LAST-TURN-MUST-SURVIVE"], \
+        "force must keep exactly the newest turn and summarize the rest"
+
+
+def test_force_compact_never_splits_a_pending_tool_group(tmp_path):
+    stm, cfg, calls = make_stm(tmp_path, ["## Pending Tool Calls\nc1"])
+    for i in range(5):
+        stm.add("user", f"old {i}")
+    stm.add_message({"role": "assistant", "content": None,
+                     "tool_calls": [{"id": "c1", "name": "search_memory_lines",
+                                     "arguments": {"query": "x"}}]})
+    settle(stm)
+
+    stm.force_compact()
+    settle(stm)
+    ctx = stm.context()
+    idx = next(i for i, m in enumerate(ctx) if m.get("tool_calls"))
+    assert ctx[idx]["tool_calls"][0]["id"] == "c1"
+    assert idx == 1, "the pending tool group must be the only verbatim turn"
+
+
+def test_force_compact_with_a_single_turn_is_a_noop(tmp_path):
+    """Nothing to fold: one turn is already the newest span, so no LLM call."""
+    stm, cfg, calls = make_stm(tmp_path, ["SHOULD NOT BE CALLED"])
+    stm.add("user", "only turn")
+    settle(stm)
+
+    stm.force_compact()
+    settle(stm)
+    assert stm.has_summary() is False
+    assert calls == [], "summarized a window that had nothing to compress"
+    assert len(stm.turns) == 1
+
+
+def test_force_compact_on_empty_window_does_not_hang(tmp_path):
+    stm, cfg, calls = make_stm(tmp_path, ["SHOULD NOT BE CALLED"])
+    stm.force_compact()
+    settle(stm)
+    assert stm.has_summary() is False and calls == []
+
+
+def test_force_compact_folds_the_prior_summary_in(tmp_path):
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\nfirst",
+                                          "## Chronology\nsecond"])
+    for i in range(20):
+        stm.add("user", f"phase one {i} " + "x" * 40)
+    settle(stm)
+    assert stm.has_summary(), "first compression never ran"
+
+    stm.add("user", "one more turn")
+    stm.force_compact()
+    settle(stm)
+    assert stm.summary == "## Chronology\nsecond"
+    assert "first" in str(calls[-1][0]), \
+        "forced pass did not carry the prior summary forward"
+
+
+def test_force_compact_keeps_messages_added_mid_flight(tmp_path):
+    """A forced pass re-slices at commit time like any other, so a message that
+    arrives while the summarizer is thinking stays verbatim."""
+    release = threading.Event()
+    entered = threading.Event()
+
+    def slow(messages):
+        entered.set()
+        release.wait(5.0)
+        return "## Chronology\ncompact"
+
+    cfg = MemoryConfig(storage_dir=tmp_path / "mem", llm=slow,
+                       max_tokens_stm=10_000, max_tokens_ltm=10_000,
+                       token_counter=CHARS, session_id="s")
+    stm = ShortTermMemory(cfg, TokenCounter(token_counter=CHARS))
+    for i in range(5):
+        stm.add("user", f"old {i}")
+    stm.force_compact()
+    assert entered.wait(5.0), "forced summarizer was never reached"
+
+    stm.add("user", "FRESH-DURING-COMPACT")
+    release.set()
+    settle(stm)
+    assert any(m.get("content") == "FRESH-DURING-COMPACT" for m in stm.context()), \
+        "a message added during a forced pass was lost"
+
+
+def test_force_compact_archives_and_feeds_ltm(tmp_path):
+    """The forced pass fires the archive hook exactly like a cap-driven one, so
+    LTM extraction happens without any extra wiring."""
+    seen = []
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\ncompact"],
+                               on_archive=lambda rel, text: seen.append((rel, text)))
+    stm.add("user", "the code word is OTTER-7")
+    stm.add("assistant", "noted")
+    settle(stm)
+
+    stm.force_compact()
+    settle(stm)
+    assert seen and seen[0][0] == "stm/s-test.md"
+    assert "OTTER-7" in seen[0][1], "forced pass did not archive the real text"
+    assert "OTTER-7" in cfg.session_file.read_text(encoding="utf-8")
+
+
+def test_force_compact_after_close_is_ignored(tmp_path):
+    """A late /compact must not wake a stopped worker or hang the caller."""
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\nx"])
+    stm.add("user", "a")
+    stm.add("user", "b")
+    settle(stm)
+    stm.close(5.0)
+
+    stm.force_compact()          # must be a quiet no-op
+    assert stm.has_summary() is False
+    assert calls == []
+
+
+def test_force_compact_does_not_block_the_caller(tmp_path):
+    """force_compact only signals: a slow summarizer must not make the caller
+    (a chat REPL) wait — wait_until_settled is the explicit way to wait."""
+    release = threading.Event()
+    entered = threading.Event()
+
+    def slow(messages):
+        entered.set()
+        release.wait(5.0)
+        return "## Chronology\ncompact"
+
+    cfg = MemoryConfig(storage_dir=tmp_path / "mem", llm=slow,
+                       max_tokens_stm=10_000, max_tokens_ltm=10_000,
+                       token_counter=CHARS, session_id="s")
+    stm = ShortTermMemory(cfg, TokenCounter(token_counter=CHARS))
+    for i in range(5):
+        stm.add("user", f"old {i}")
+    settle(stm)
+
+    start = time.perf_counter()
+    stm.force_compact()
+    elapsed = time.perf_counter() - start
+    assert elapsed < 0.05, f"force_compact blocked {elapsed:.3f}s on the summarizer"
+
+    release.set()
+    settle(stm)
+    assert stm.has_summary()

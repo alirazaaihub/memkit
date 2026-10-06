@@ -182,6 +182,21 @@ class Memory:
                     "ltm/ memory files from the conversation.")
         return self.toolset.execute(name, arguments)
 
+    def compact(self, timeout: float | None = None) -> bool:
+        """Summarize short-term memory right now, ignoring the STM token cap.
+
+        What a user-facing ``/compact`` command calls: it produces a summary
+        on demand instead of waiting for the window to fill, keeping only the
+        newest turn (or a still-pending tool-call group) verbatim. The folded
+        text stays verbatim-recoverable from the transcript, and the archive
+        feeds LTM extraction exactly as a cap-driven summary does.
+
+        Blocks until the summarizer settles (or ``timeout`` elapses); returns
+        True if it settled. A window with a single span already has nothing to
+        fold, so this returns True without an LLM call."""
+        self.stm.force_compact()
+        return self.stm.wait_until_settled(timeout)
+
     def flush(self, timeout: float | None = None) -> bool:
         """Wait for the background **LTM** worker to finish everything queued.
 

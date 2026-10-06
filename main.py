@@ -10,7 +10,8 @@ search_memory_lines / list_memory_files for its stored memories. They only
 ever see inside the memory folder — they are not generic file tools.
 
 Commands:  exit / quit  ends the session (final memories are extracted),
-           reset       starts a fresh short-term window (LTM is kept).
+           reset       starts a fresh short-term window (LTM is kept),
+           /compact    summarize now, whether or not the window is full.
 """
 import sys
 from pathlib import Path
@@ -96,7 +97,8 @@ def agent_turn(user_text: str) -> str:
 
 # ---- 3. chat loop ------------------------------------------------------------
 print(f"memkit demo — talking to {env['TOKENHARBOR_MODEL']} as user {USER_ID!r}. "
-      f"memories in {mem.memory_root}/  ('exit' to quit, 'reset' for a new STM window)")
+      f"memories in {mem.memory_root}/  ('exit' to quit, 'reset' for a new STM "
+      f"window, '/compact' to summarize now)")
 _index_path = mem.memory_root / "ltm" / "MEMORY.md"
 if _index_path.exists():
     print("[ltm index from previous runs]\n" + _index_path.read_text(encoding="utf-8").strip() + "\n")
@@ -114,6 +116,16 @@ while True:
         mem.close()  # flush this session's memories
         mem = build_memory()  # same caps — a fresh STM window, LTM kept
         print("bot> (fresh short-term window; long-term memory kept)\n")
+        continue
+    if text.lower() in ("/compact", "compact"):
+        before = mem.stm.token_count()
+        mem.compact()  # summarize now, cap or no cap
+        after = mem.stm.token_count()
+        if after < before:
+            print(f"bot> (memory compacted: {before} -> {after} tokens; the older "
+                  f"turns live on in the summary and, verbatim, in the transcript)\n")
+        else:
+            print("bot> (nothing to compact — the window is already just one turn)\n")
         continue
     print("bot> " + agent_turn(text) + "\n")
 

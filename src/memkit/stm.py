@@ -87,6 +87,10 @@ class ShortTermMemory:
         self._work = threading.Event()
         self._idle = threading.Event()
         self._idle.set()          # nothing to compress yet
+        # One-shot "compress now, cap or no cap" request (force_compact). It
+        # carries *what* the pass should do, while `_work` only says "wake up",
+        # so a forced pass and an ordinary over-cap pass cannot be confused.
+        self._force = threading.Event()
         self._stopped = threading.Event()
         self._thread = threading.Thread(
             target=self._worker_loop, name="memkit-stm", daemon=True)
@@ -142,6 +146,30 @@ class ShortTermMemory:
     def transcript_rel(self) -> str:
         """Storage-relative path of this conversation's transcript file."""
         return self._rel
+
+    def force_compact(self) -> None:
+        """Ask the summarizer to compress NOW, whether or not the window is
+        over cap — this is what a user's ``/compact`` command calls.
+
+        One forced pass ignores ``keep_recent``: it keeps only the newest span
+        verbatim (the last message, or a still-pending tool-call group) and
+        summarizes everything before it, so a summary is produced even from a
+        short conversation. A window with nothing to fold (0 or 1 span) makes
+        it a no-op.
+
+        Returns immediately — the LLM call stays on the background thread, so a
+        caller's UI never blocks; ``wait_until_settled`` is the explicit way to
+        wait for the summary to appear. A call after ``close`` is ignored.
+        """
+        if self._stopped.is_set():
+            return
+        # Take the lock exactly as _ensure_budget does, so wait_until_settled
+        # stays race-free: the worker can never look idle while a forced pass
+        # is armed but unserviced.
+        with self._lock:
+            self._force.set()
+            self._idle.clear()
+            self._work.set()
 
     # -- internals --------------------------------------------------------------
 
@@ -215,9 +243,14 @@ class ShortTermMemory:
             while guard < 10:
                 guard += 1
                 with self._lock:
-                    if self.token_count() <= self.config.max_tokens_stm:
+                    # Consume the one-shot force request (one pass per call), so
+                    # a /compact cannot be confused with an ordinary over-cap
+                    # pass: while it is set, "over cap" is not what decides.
+                    forced = self._force.is_set()
+                    self._force.clear()
+                    if not forced and self.token_count() <= self.config.max_tokens_stm:
                         break
-                if not self._summarize_once():
+                if not self._summarize_once(force=forced):
                     break  # nothing to compress, or it failed; next add retries
             with self._lock:
                 # An append that arrived during the pass cleared `_idle` and set
@@ -226,17 +259,22 @@ class ShortTermMemory:
                 if not self._work.is_set():
                     self._idle.set()
 
-    def _summarize_once(self) -> bool:
+    def _summarize_once(self, force: bool = False) -> bool:
         """Compress one batch. Returns False if no progress was possible.
 
         Runs on the worker thread only, in three steps: a short locked
         snapshot, a slow lock-free LLM section, then a short locked commit.
         Every field the live window can observe is mutated under ``_lock``;
         the middle step touches nothing the main thread reads.
+
+        ``force`` (a /compact request) is passed through to ``_choose_split``
+        so this one pass keeps only the newest span verbatim. Everything else —
+        archive-before-summarize, the mid-flight re-slice, feeding LTM — is
+        the ordinary path.
         """
         # 1. Snapshot (locked): only what this compression will consume.
         with self._lock:
-            t = self._choose_split()
+            t = self._choose_split(force)
             if t <= 0:
                 if self.token_count() > self.config.max_tokens_stm:
                     self.config.logger.warning(
@@ -395,7 +433,7 @@ class ShortTermMemory:
         if available > 0:
             self.summary = self.counter.truncate(self.summary, available)
 
-    def _choose_split(self) -> int:
+    def _choose_split(self, force: bool = False) -> int:
         """Index in self.turns where the verbatim tail begins.
 
         Never splits a tool-call group; always keeps the most recent group
@@ -403,9 +441,16 @@ class ShortTermMemory:
         all arrived (pending tool calls) — those stay in the window no
         matter the token cap, because dropping a still-needed call breaks
         the agent's task.
+
+        ``force`` is the /compact path: the cap is irrelevant, so the
+        ``keep_recent`` tail is ignored and only the newest span stays
+        verbatim. That guarantees a summary out of any window holding more
+        than one span — the point of an on-demand compaction.
         """
         turns = self.turns
         spans = _tool_spans(turns)
+        if force:
+            return spans[-1][0] if spans else 0
         keep_budget = self.config.keep_recent * self.config.max_tokens_stm
         acc = 0
         t = 0  # default: compress everything but we may not; see below

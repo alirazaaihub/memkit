@@ -281,3 +281,52 @@ def test_short_session_still_produces_memories(tmp_path):
     topic = ltm / "links.md"
     assert topic.exists()
     assert "Nov 12" in topic.read_text(encoding="utf-8")
+
+
+# -- on-demand compaction (/compact) --------------------------------------------
+# The host app exposes "/compact"; it calls Memory.compact() so the user can get
+# a summary whenever they want one, not only when the cap happens to be hit.
+
+def test_compact_summarizes_long_before_the_cap(tmp_path):
+    mem = make_memory(tmp_path)
+    for i in range(6):
+        mem.add("user", f"tiny {i}")
+    assert mem.stm.has_summary() is False, "test is void — already over cap"
+
+    assert mem.compact(timeout=10.0) is True
+    assert mem.stm.has_summary(), "compact did not summarize an under-cap window"
+    assert "compressed" in mem.stm.summary
+    mem.close()
+
+
+def test_compact_folds_older_turns_into_the_summary(tmp_path):
+    """What the /compact command relies on: the window shrinks to the summary
+    plus the newest turn, and the folded-away text stays verbatim-recoverable."""
+    mem = make_memory(tmp_path)
+    mem.add("user", "the code word is OTTER-7")
+    for i in range(5):
+        mem.add("assistant", f"ack {i}")
+    before = len(mem.stm.turns)
+
+    assert mem.compact(timeout=10.0) is True
+    after = len(mem.stm.turns)
+    assert after < before, f"compact kept every turn ({before} -> {after})"
+    assert after == 1, "only the newest turn should stay verbatim"
+    # the dropped text is not gone: it is in the transcript, word for word
+    assert "OTTER-7" in mem.execute_tool("recall_transcript", {"query": "OTTER-7"})
+    mem.close()
+
+
+def test_compact_feeds_ltm_extraction(tmp_path):
+    """A forced summary archives the same text a cap-driven one would, so the
+    LTM extraction job is queued automatically — no extra wiring."""
+    mem = make_memory(tmp_path)
+    mem.add("user", "I always want short answers")
+    for i in range(5):
+        mem.add("assistant", f"ok {i}")
+
+    mem.compact(timeout=10.0)
+    assert mem.flush(timeout=10), "background LTM worker never drained"
+    mem.close()
+    user_md = mem.storage_dir / "ltm" / "user.md"
+    assert user_md.exists(), "forced compaction did not feed LTM extraction"
