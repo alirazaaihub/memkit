@@ -35,6 +35,18 @@ def test_session_id_is_user_settable_for_reuse_across_apps(tmp_path):
     assert c.session_id == "my-chatbot-1"
 
 
+def test_explicit_session_id_none_means_generate_one(tmp_path):
+    """The bug: the facade forwards its own ``session_id=None`` default straight
+    through, and a dataclass default_factory only fires when the argument is
+    OMITTED — so an explicit None reached validation and raised
+    `ValueError: session_id must be a simple directory/file name ... got None`.
+    An explicit None must mean "generate one", exactly as the type says."""
+    c = cfg(tmp_path, session_id=None)
+    assert c.session_id
+    _validate = uuid.UUID(hex=c.session_id)   # a real, generated uuid
+    assert c.session_id != cfg(tmp_path, session_id=None).session_id
+
+
 def test_session_file_is_one_file_named_by_session_id(tmp_path):
     c = cfg(tmp_path, session_id="chat-abc")
     assert c.session_file == tmp_path / "mem" / "stm" / "chat-abc.md"

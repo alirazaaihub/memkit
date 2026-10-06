@@ -59,6 +59,12 @@ class ShortTermMemory:
         self._lock = threading.RLock()
         self.turns: list[dict[str, Any]] = []       # verbatim messages only
         self.summary: str | None = None
+        # Running token total of `turns`, maintained incrementally under
+        # `_lock`. Without it, every add() re-tokenized the WHOLE window just to
+        # answer "are we over cap?" — an O(window) cost on the hot path that
+        # grows with the conversation. token_count() still measures the truth
+        # and re-syncs this whenever the two could disagree.
+        self._turns_tokens = 0
         # The user owns this cap when they set it; otherwise derive it from the
         # STM budget (35%, min 300) as a sane default.
         self._max_summary_tokens = (
@@ -114,13 +120,16 @@ class ShortTermMemory:
             msg["tool_call_id"] = tool_call_id
         with self._lock:
             self.turns.append(msg)
+            self._turns_tokens += self.counter.count_message(msg)
             self._ensure_budget()
 
     def add_message(self, msg: dict[str, Any]) -> None:
         if "role" not in msg:
             raise ValueError("message dict must have a 'role'")
         with self._lock:
-            self.turns.append(dict(msg))
+            stored = dict(msg)
+            self.turns.append(stored)
+            self._turns_tokens += self.counter.count_message(stored)
             self._ensure_budget()
 
     def context(self) -> list[dict[str, Any]]:
@@ -133,14 +142,34 @@ class ShortTermMemory:
 
     def token_count(self) -> int:
         with self._lock:
-            total = self.counter.count_messages(self.turns)
+            measured = self.counter.count_messages(self.turns)
+            if measured != self._turns_tokens:
+                # Only reachable if a mutation bypassed the incremental path
+                # (a direct `turns` edit by a caller): re-sync so the hot path
+                # keeps its cheap running total.
+                self._turns_tokens = measured
             if self.summary:
-                total += self.counter.count_message(
+                measured += self.counter.count_message(
                     {"role": "user", "content": self._summary_text()})
-            return total
+            return measured
 
     def has_summary(self) -> bool:
         return bool(self.summary)
+
+    def unarchived_transcript(self) -> str:
+        """Numbered text of the turns no summarization has archived yet.
+
+        This is the only part of the window LTM extraction has never seen: every
+        archived span was already fed to extraction by the ``on_archive`` hook.
+        Session end extracts exactly this delta, so it can never duplicate work
+        that was queued (or done) during the conversation. Returns "" when
+        everything in the window is already on disk.
+        """
+        with self._lock:
+            if self._appended >= len(self.turns):
+                return ""
+            return _render_transcript(self.turns[self._appended:],
+                                      first_lineno=self._lines + 1)
 
     @property
     def transcript_rel(self) -> str:
@@ -190,8 +219,18 @@ class ShortTermMemory:
         transition share this lock, which is what makes ``wait_until_settled``
         race-free — the worker can never declare itself idle while an
         over-budget append is still unserviced.
+
+        The check costs O(1), not O(window): it uses the running tail total plus
+        one token count of the summary, both of which the append already paid
+        for. Re-counting every message here made each add() cost grow with the
+        conversation.
         """
-        if self.token_count() <= self.config.max_tokens_stm:
+        if not self.summary:
+            if self._turns_tokens <= self.config.max_tokens_stm:
+                return
+        elif (self._turns_tokens + self.counter.count_message(
+                {"role": "user", "content": self._summary_text()})
+                <= self.config.max_tokens_stm):
             return
         self._idle.clear()
         self._work.set()
@@ -214,6 +253,15 @@ class ShortTermMemory:
         After ``close`` the window is frozen: no further compression runs, and
         ``add`` only appends (text that was never summarized is still durable
         in the transcript). Safe to call twice and from ``atexit``.
+
+        Returns True only when the summarizer actually settled first. A pass
+        that outlives ``timeout`` keeps the thread alive to finish its commit:
+        killing it mid-pass is not an option (its LLM call is uninterruptible)
+        and reporting "settled" would let the caller read and then clear a
+        window that a late commit then rewrites — dropping the newest turns
+        from the live context. The timeout only contains the *garbage
+        collection* — the thread stops itself when the pass ends — it never
+        contains liveness.
         """
         if self._stopped.is_set():
             return True
@@ -221,8 +269,12 @@ class ShortTermMemory:
         self._stopped.set()
         self._work.set()          # wake the worker so it sees the stop flag
         thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout if timeout is not None else 5.0)
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            # Unbounded: the stop flag is already set and `_worker_loop` checks
+            # it before every pass, so the thread cannot start new work — it
+            # only finishes the commit it is inside. See the docstring.
+            thread.join()
         return settled
 
     def _worker_loop(self) -> None:
@@ -256,7 +308,10 @@ class ShortTermMemory:
                 # An append that arrived during the pass cleared `_idle` and set
                 # `_work`; leave `_idle` clear so the waiters keep waiting and
                 # loop around for another drain instead of reporting settled.
-                if not self._work.is_set():
+                # Once `close` has stopped the window, `_idle` is the closer's
+                # to manage: waking a waiter now would report "settled" for a
+                # window that is frozen mid-pass.
+                if not self._work.is_set() and not self._stopped.is_set():
                     self._idle.set()
 
     def _summarize_once(self, force: bool = False) -> bool:
@@ -311,6 +366,10 @@ class ShortTermMemory:
             self.summary = new_summary
             self.turns = self.turns[t:]
             self._appended = max(0, self._appended - t)
+            # Re-derive the running total from the live tail rather than
+            # subtracting: the compressed prefix and the retained tail are
+            # disjoint, so this is exact and cannot drift.
+            self._turns_tokens = self.counter.count_messages(self.turns)
             # Overflow guard: if the summary alone is huge, trim its Chronology.
             self._fit_summary(new_summary)
 
@@ -406,7 +465,7 @@ class ShortTermMemory:
 
     def _fit_summary(self, summary: str) -> None:
         window = (self.counter.count_text(self._summary_text())
-                  + self.counter.count_messages(self.turns))
+                  + self._turns_tokens)
         if window <= self.config.max_tokens_stm:
             return
         self.config.logger.warning(
@@ -416,9 +475,15 @@ class ShortTermMemory:
         chrono_at = next((i for i, l in enumerate(lines)
                           if l.strip().lower().startswith("## chronology")), None)
         if chrono_at is not None and len(lines) - chrono_at > 4:
-            # keep the heading + the most recent few chronology lines
+            # Keep the heading plus the most recent few chronology lines. When
+            # the body is already short enough that keep_from lands ON the
+            # heading, slicing from it is the right answer — but do not then
+            # prepend lines[:chrono_at + 1], which would duplicate the heading.
             keep_from = max(chrono_at, len(lines) - 5)
-            trimmed = "\n".join(lines[:chrono_at + 1] + lines[keep_from:])
+            if keep_from == chrono_at:
+                trimmed = "\n".join(lines[chrono_at:])
+            else:
+                trimmed = "\n".join(lines[:chrono_at + 1] + lines[keep_from:])
             if self.counter.count_text(trimmed) < self.counter.count_text(summary):
                 self.summary = trimmed
 
@@ -427,7 +492,7 @@ class ShortTermMemory:
         # is not lost forever: the raw originals are in the transcript.
         wrapped = self.counter.count_message(
             {"role": "user", "content": self._summary_text()})
-        tail_cost = self.counter.count_messages(self.turns)
+        tail_cost = self._turns_tokens
         overhead = wrapped - self.counter.count_text(self.summary)
         available = self.config.max_tokens_stm - tail_cost - overhead
         if available > 0:

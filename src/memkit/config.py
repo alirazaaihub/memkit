@@ -67,6 +67,10 @@ class MemoryConfig:
     # / user_id, when a user_id was given). Every directory below hangs off it,
     # so a different user_id transparently switches to a separate memory set.
     root_dir: Path = field(init=False)
+    # None means "generate one": the facade forwards its own ``session_id=None``
+    # default straight through, and a dataclass default_factory only fires when
+    # the argument is omitted — so an explicit None would otherwise reach
+    # validation and be rejected as a non-leaf name.
     session_id: str = field(default_factory=_generate_session_id)
     # Names the per-user memory root: Memory(dir, user_id="alice") keeps this
     # user's whole memory set (ltm/ + stm/) under dir/alice/, so one storage
@@ -78,6 +82,10 @@ class MemoryConfig:
 
     def __post_init__(self) -> None:
         self.storage_dir = Path(self.storage_dir)
+        # Treat an explicit None as "not given" — that is what the type says it
+        # is, and the facade always passes the argument along.
+        if self.session_id is None:
+            self.session_id = _generate_session_id()
         # session_id becomes the transcript's file name (stm/<session_id>.md): a
         # value with separators or traversal could escape storage_dir via our
         # own writes, bypassing the MemoryTools path guard. Keep it a leaf name.

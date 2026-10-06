@@ -20,6 +20,7 @@ extraction, so short sessions that never hit the cap still leave memories.
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -312,20 +313,62 @@ class LongTermMemory:
             if not index.strip():
                 atomic_write(index_path, "# Memory Index\n\n(no topic files yet)\n")
             return
-        lines = [l for l in index.splitlines()
-                 if not any(f"[{n}]" in l for n in stale)
-                 and l.strip() != "(no topic files yet)"]
+        # Decide staleness from the same parsed entries used above — a raw
+        # "[name]" substring test would keep a restyled line for one file while
+        # dropping an exact one for another on the very same line. A line whose
+        # entries are ALL gone is dropped; a line that mixes live and gone
+        # entries keeps its live ones and has the dead ones cut out of it (the
+        # index must never advertise a file that is not there). Headers and
+        # prose (no entries) are never dropped, and the "no topic files yet"
+        # placeholder goes away as soon as the tree has a real topic file.
+        lines: list[str] = []
+        for line in index.splitlines():
+            entries = _index_entries(line)
+            if entries and all(n in stale for n in entries):
+                continue
+            if entries and any(n in stale for n in entries):
+                kept = _drop_stale_entries(line, stale)
+                if kept:
+                    lines.append(kept)
+                continue
+            if line.strip() == "(no topic files yet)" and topics:
+                continue
+            lines.append(line)
         for name in missing:
             hook = _first_line(self.ltm_dir / name) or "no description yet"
             lines.append(f"- [{name}] — {hook[:120]}")
-        atomic_write(index_path, "\n".join(lines).rstrip() + "\n")
+        body = "\n".join(lines).rstrip()
+        if not body.strip():  # everything was stale: leave a valid, empty index
+            body = "# Memory Index\n\n(no topic files yet)"
+        atomic_write(index_path, body + "\n")
+
+
+_ENTRY_RE = re.compile(r"\[\s*([\w.\-]+\.md)\s*\]")
 
 
 def _index_entries(index: str) -> list[str]:
-    import re
     # tolerate whitespace inside the brackets so a lightly restyled index line
     # is still recognised as listing that file (else repair appends a duplicate)
-    return re.findall(r"\[\s*([\w.\-]+\.md)\s*\]", index)
+    return _ENTRY_RE.findall(index)
+
+
+def _drop_stale_entries(line: str, stale: list[str]) -> str:
+    """Cut the entries naming a deleted file out of an index line, keeping the
+    live ones and the prose around them (``- [a.md] / [b.md] — pair`` becomes
+    ``- [a.md] — pair`` when b.md is gone). Returns "" if nothing of the line
+    is left, so a line that was nothing but stale entries disappears."""
+    dead = set(stale)
+
+    def _keep(m: re.Match) -> str:
+        return "" if m.group(1) in dead else m.group(0)
+
+    kept = _ENTRY_RE.sub(_keep, line)
+    # The entries are joined by separators that must go with them, or a lone
+    # survivor is left with dangling punctuation: strip any / , or — run that
+    # now sits at the start or end of the line.
+    kept = re.sub(r"^[\s/,;|\-—]+", "", kept)
+    kept = re.sub(r"[\s/,;|\-—]+$", "", kept)
+    return kept.strip() if _index_entries(kept) else ""
 
 
 def _first_line(path: Path) -> str:

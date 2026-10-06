@@ -24,14 +24,15 @@ See module docstrings of stm/ltm/worker for the internals.
 from __future__ import annotations
 
 import atexit
+import logging
 import threading
 from typing import Any, Callable
 
-from memkit.config import MemoryConfig, _generate_session_id
+from memkit.config import MemoryConfig
 from memkit.llm import adapt_llm
 from memkit.ltm import LongTermMemory
 from memkit.prompts import system_prompt_fragment as _build_fragment
-from memkit.stm import ShortTermMemory, _render_transcript
+from memkit.stm import ShortTermMemory
 from memkit.tokens import TokenCounter
 from memkit.tools import MemoryTools, read_specs
 from memkit.worker import MemoryWorker
@@ -72,20 +73,16 @@ class Memory:
         # (used as-is), one of memkit's adapters, or a provider SDK *client*
         # object (openai.OpenAI(...), anthropic.Anthropic(), ...), which
         # adapt_llm recognizes by its API surface and wraps for them.
-        llm = adapt_llm(llm, logger)
+        # A logger was passed: use it for the adapter's own messages too, rather
+        # than the package logger, so an adapt notice goes where the user looks.
+        early_logger = logger or logging.getLogger("memkit")
+        llm = adapt_llm(llm, early_logger)
         if llm_tools is not None:
-            llm_tools = adapt_llm(llm_tools, logger)
+            llm_tools = adapt_llm(llm_tools, early_logger)
         else:
             # adapters (OpenAILLM/AnthropicLLM) carry their own tool-capable
             # callable; anything else that has one is honored too.
             llm_tools = getattr(llm, "with_tools", None)
-        # No tool caller is not fatal: extraction and inbox persistence still
-        # run, and ltm.consolidate() degrades to logged inbox-only mode.
-        # Semantic merging/pruning needs one, so say so once, here.
-        if llm_tools is None and logger is not None:
-            logger.info(
-                "memkit: no tool-calling llm detected — LTM consolidation "
-                "will not run (facts are still saved to topic files).")
 
         self.config = MemoryConfig(
             storage_dir=storage_dir,
@@ -100,11 +97,20 @@ class Memory:
             max_summary_tokens=max_summary_tokens,
             agent_loop_max_steps=agent_loop_max_steps,
             atexit_timeout=atexit_timeout,
-            session_id=session_id or _generate_session_id(),
+            session_id=session_id,
             user_id=user_id,
             retries=retries,
             logger=logger,
         )
+        # No tool caller is not fatal: extraction and inbox persistence still
+        # run, and ltm.consolidate() degrades to logged inbox-only mode.
+        # Semantic merging/pruning needs one, so say so once — through the
+        # config's resolved logger, which exists whether or not the user
+        # passed one.
+        if llm_tools is None:
+            self.config.logger.info(
+                "memkit: no tool-calling llm detected — LTM consolidation "
+                "will not run (facts are still saved to topic files).")
         cfg = self.config
         cfg.storage_dir.mkdir(parents=True, exist_ok=True)
 
@@ -216,7 +222,17 @@ class Memory:
     # -- internals ------------------------------------------------------------
 
     def _maybe_check_ltm_budget(self) -> None:
+        """Every ``_LTM_CHECK_EVERY`` adds, ask the worker to look at the budget.
+
+        The counter is read and reset under ``_state_lock`` so concurrent
+        ``add()``s cannot both decide they are the "due" one; the budget scan
+        itself (a whole-tree token count) stays outside the lock — it is the
+        expensive part, and a duplicate consolidate job is a no-op when the
+        tree is already under budget.
+        """
         with self._state_lock:
+            if self._finalized:
+                return
             self._adds_since_check += 1
             due = self._adds_since_check >= _LTM_CHECK_EVERY
             if due:
@@ -261,11 +277,11 @@ class Memory:
         # reads below are lock-free (safe only once the worker is idle).
         settle_timeout = timeout if timeout is not None else self.config.atexit_timeout
         self.stm.wait_until_settled(settle_timeout)
-        # Extract whatever is still in the window (covers sessions that never
-        # hit max_tokens_ltm) — queued, then drained synchronously by close().
-        remaining = _render_transcript(self.stm.turns)
-        if self.stm.summary:
-            remaining = self.stm.summary + "\n" + remaining
+        # Extract only the turns no summarization has archived (covers sessions
+        # that never hit max_tokens_ltm) — queued, then drained by close().
+        # Archived spans were already handed to extraction by on_archive, so
+        # re-rendering the whole window here would duplicate that LLM work.
+        remaining = self.stm.unarchived_transcript()
         if remaining.strip():
             self.worker.submit(("extract", ("End-of-session conversation", remaining)))
         if self.ltm.inbox_pending():

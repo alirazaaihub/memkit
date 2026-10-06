@@ -151,6 +151,22 @@ def test_list_memory_files_shows_relative_paths(tools):
     assert "stm/s1.md" in out
 
 
+def test_inbox_is_invisible_to_listing_and_search(tools, tmp_path):
+    """The bug: ``ltm/_inbox.md`` is the worker's staging area — raw, unvetted
+    facts that are deleted the moment they are folded into topic files. It was
+    listed and searched like any memory file, so the agent could read (and cite)
+    lines that were about to vanish, and hits on it could 404 on the very next
+    call. It must be invisible to both scans."""
+    inbox = tmp_path / "ltm" / "_inbox.md"
+    inbox.write_text("FACT | x.md | new | STAGED_INBOX_FACT\n", encoding="utf-8")
+
+    assert "_inbox" not in tools.list_memory_files()
+    assert "No matches" in tools.search_memory_lines("STAGED_INBOX_FACT")
+    # ...while the real memory files are still scanned as before
+    assert "ltm/user.md" in tools.list_memory_files()
+    assert "ltm/user.md:2:" in tools.search_memory_lines("prefers Python")
+
+
 # -- recall_transcript: THE verbatim-recovery tool ----------------------------------
 
 def test_recall_returns_verbatim_window_around_match(tools):

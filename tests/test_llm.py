@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 
-from memkit.llm import OpenAILLM
+from memkit.llm import AnthropicLLM, OpenAILLM
 
 
 # -- fakes ---------------------------------------------------------------------
@@ -115,3 +115,54 @@ def test_plain_call_also_serializes_normalized_history_as_wire_format():
     call = sent[0]["tool_calls"][0]
     assert call["type"] == "function"
     assert json.loads(call["function"]["arguments"]) == {"file_path": "stm/s.md"}
+
+
+# -- inbound conversion: memkit-normalized history -> Anthropic ----------------
+
+def test_anthropic_tool_result_after_a_plain_user_message():
+    """The bug: a tool result whose preceding turn is an ordinary user TEXT
+    message crashed the conversion with `'str' object has no attribute 'get'`
+    — the merge branch assumed the previous turn's content was a block list.
+    It must start a new user turn instead of merging into (or crashing on) a
+    string-content message."""
+    _, converted = AnthropicLLM._to_anthropic(None, [
+        {"role": "user", "content": "what is in the file?"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "name": "read_memory_file",
+             "arguments": {"file_path": "ltm/user.md"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "line 1"},
+        {"role": "tool", "tool_call_id": "c2", "content": "line 2"},
+    ])
+
+    assert converted[0] == {"role": "user", "content": "what is in the file?"}
+    # both results land in ONE tool_result turn, never appended to the text turn
+    results = converted[-1]
+    assert results["role"] == "user"
+    assert [b["type"] for b in results["content"]] == ["tool_result", "tool_result"]
+    assert [b["tool_use_id"] for b in results["content"]] == ["c1", "c2"]
+    assert all(isinstance(b["content"], str) for b in results["content"])
+
+
+def test_anthropic_tool_results_still_merge_into_one_turn():
+    """The merge the crash above was guarding: consecutive tool results with NO
+    intervening user text must still collapse into a single user message, which
+    is what the Messages API expects."""
+    _, converted = AnthropicLLM._to_anthropic(None, [
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "name": "a", "arguments": {}},
+            {"id": "c2", "name": "b", "arguments": {}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+    ])
+
+    assert len(converted) == 2, converted
+    assert [b["tool_use_id"] for b in converted[1]["content"]] == ["c1", "c2"]
+
+
+def test_anthropic_error_tool_result_is_flagged():
+    """A failed tool result keeps its is_error flag through the merge."""
+    _, converted = AnthropicLLM._to_anthropic(None, [
+        {"role": "tool", "tool_call_id": "c1", "content": "Error: no such file"},
+    ])
+
+    assert converted[0]["content"][0]["is_error"] is True

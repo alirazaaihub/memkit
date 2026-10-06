@@ -2,12 +2,17 @@
 
 Every LTM-touching job (extraction of an archived STM segment, budget
 consolidation, final flush extraction) is enqueued here so the user's agent
-never waits on memory maintenance — answering speed is unaffected. The worker
-thread is the ONLY place ltm/ files are written during normal operation,
-which is what keeps the tree consistent without file locks.
+never waits on memory maintenance — answering speed is unaffected. During
+normal operation the worker thread is the only place ltm/ files are written,
+and an inline overflow/closed-path job holds ``_handler_lock`` while it runs,
+so that "one writer at a time" invariant — which is what keeps the tree
+consistent without file locks — is preserved on both paths.
 
 Queue overflow: if the queue is saturated the job runs INLINE on the caller
-thread (slower) rather than dropping memories silently.
+thread (slower) rather than dropping memories silently. Inline runs take the
+same handler lock the worker thread takes, so "one writer at a time" — the
+invariant that lets ltm/ be updated without file locks — holds on that path
+too: the caller waits for the job in flight, then runs its own.
 
 Shutdown: ``close()``/``flush()`` drain deterministically; ``atexit`` covers
 users who forget to close (joined with ``atexit_timeout``). A hard SIGKILL can
@@ -37,6 +42,12 @@ class MemoryWorker:
     def __init__(self, handler: Callable[[Any], None], logger: logging.Logger,
                  atexit_timeout: float = 30.0) -> None:
         self._handler = handler
+        # Serializes handler execution against the worker thread. Jobs normally
+        # run on that thread only, so this is uncontended; it matters on the
+        # inline paths (queue saturated, or closed), where the caller thread
+        # would otherwise run a handler concurrently with an in-flight job and
+        # two writers could interleave on the same ltm/ files.
+        self._handler_lock = threading.Lock()
         self.logger = logger
         self._queue: queue.Queue = queue.Queue()
         self._closed = False
@@ -62,9 +73,12 @@ class MemoryWorker:
                 self.logger.warning(
                     "memkit worker: queue saturated (%d jobs); running a job "
                     "inline instead of dropping it.", _MAX_QUEUED)
-            # closed/overflow: run inline now, never vanish
+            # closed/overflow: run inline now, never vanish. The lock makes the
+            # inline run exclusive with the worker thread's current job, so the
+            # single-writer guarantee survives this path.
             try:
-                self._handler(job)
+                with self._handler_lock:
+                    self._handler(job)
             except Exception:
                 self.logger.exception("memkit worker: inline job failed")
             if done:
@@ -110,6 +124,16 @@ class MemoryWorker:
     def _atexit_shutdown(self) -> None:
         if self._closed:
             return
+        # Drain BEFORE the SENTINEL. Putting the sentinel first stops the thread
+        # immediately and silently discards everything still queued — the exact
+        # opposite of the point of atexit, where the user forgot close() and the
+        # session's extractions are the only thing left to save.
+        drained = self.flush(self._atexit_timeout)
+        if not drained:
+            self.logger.warning(
+                "memkit worker: atexit flush timed out after %.1fs; remaining "
+                "queued jobs are lost (STM archives are already on disk).",
+                self._atexit_timeout)
         self._closed = True
         self._queue.put((SENTINEL, None))
         self._thread.join(timeout=self._atexit_timeout)
@@ -124,7 +148,8 @@ class MemoryWorker:
                     return
                 if job == "__barrier__":
                     continue
-                self._handler(job)
+                with self._handler_lock:
+                    self._handler(job)
             except Exception:
                 self.logger.exception("memkit worker: job %r failed", job)
             finally:

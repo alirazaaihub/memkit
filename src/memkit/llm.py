@@ -227,9 +227,16 @@ class AnthropicLLM:
                 if text.startswith("Error:"):
                     block["is_error"] = True
                 # Anthropic wants all tool_results for a turn in ONE user message.
-                if converted and converted[-1]["role"] == "user" and \
-                        converted[-1]["content"][0].get("type") == "tool_result":
-                    converted[-1]["content"].append(block)
+                # The preceding turn may be an ordinary user text message, whose
+                # content is a STRING, not a block list — merging into it would
+                # send invalid content (and crash on `.get`), so only merge into
+                # a previous user turn that is itself a tool_result block list.
+                prev = converted[-1] if converted else None
+                if (prev is not None and prev.get("role") == "user"
+                        and isinstance(prev.get("content"), list)
+                        and prev["content"]
+                        and prev["content"][0].get("type") == "tool_result"):
+                    prev["content"].append(block)
                 else:
                     converted.append({"role": "user", "content": [block]})
             else:  # user (or anything the provider can still read as user)

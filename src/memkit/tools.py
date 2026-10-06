@@ -33,6 +33,11 @@ from typing import Any
 
 # Longest single match line echoed back by search_memory_lines (keeps results scannable).
 _MAX_MATCH_CHARS = 200
+# The memkit-managed staging file for extracted-but-unconsolidated facts. It is
+# transient internal state, not a memory the agent should read or cite, so the
+# listing and search scans skip it. Mirror of ltm.INBOX_NAME (kept as a local
+# literal because ltm imports tools, not the other way around).
+_INBOX_NAME = "_inbox.md"
 # Most files list_memory_files will name.
 _MAX_LISTED = 500
 # Hard cap on lines recall_transcript returns, however it is asked.
@@ -290,6 +295,7 @@ class MemoryTools:
         files: list[Path] = []
         for path in sorted(self.root.rglob("*")):
             if (path.is_file() and "__pycache__" not in path.parts
+                    and path.name != _INBOX_NAME
                     and not self._is_foreign_transcript(path.resolve())):
                 files.append(path)
                 if len(files) >= _MAX_LISTED:
@@ -392,11 +398,14 @@ class MemoryTools:
         """Every .md the current agent may search: ltm/ + its own transcript.
 
         Other conversations' transcripts are excluded — that is the isolation
-        the per-session file exists to provide.
+        the per-session file exists to provide — and so is ltm/_inbox.md, which
+        is memkit's transient staging file (its facts are folded into topic
+        files, then it is deleted), not something the agent should cite.
         """
         files: list[Path] = []
         for path in sorted(self.root.rglob("*.md")):
-            if path.is_file() and not self._is_foreign_transcript(path.resolve()):
+            if (path.is_file() and path.name != _INBOX_NAME
+                    and not self._is_foreign_transcript(path.resolve())):
                 files.append(path)
                 if len(files) >= _MAX_LISTED:
                     break

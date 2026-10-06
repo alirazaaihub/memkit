@@ -179,3 +179,52 @@ def test_repair_index_adds_missing_and_drops_stale(tmp_path):
     (cfg.ltm_dir / "orphan.md").unlink()
     ltm._repair_index()
     assert "[orphan.md]" not in ltm.read_index()
+
+
+def test_repair_index_keeps_a_line_that_lists_a_live_file(tmp_path):
+    """The bug: stale lines were dropped by a raw `"[name]" in line` substring
+    test, so a single line listing two files was deleted the moment EITHER file
+    was gone — silently dropping the live file's entry. Only a line whose
+    entries are ALL stale may go."""
+    ltm, cfg = make_ltm(tmp_path)
+    (cfg.ltm_dir / "alive.md").write_text("- (as of 2026-10-01) still here\n",
+                                          encoding="utf-8")
+    # one line, two entries: alive.md exists, gone.md was deleted
+    (cfg.ltm_dir / "MEMORY.md").write_text(
+        "# Memory Index\n- [alive.md] / [gone.md] — pair\n", encoding="utf-8")
+
+    ltm._repair_index()
+    index = ltm.read_index()
+
+    assert "alive.md" in index, f"the live entry was dropped:\n{index}"
+    assert "gone.md" not in index, f"the stale entry survived:\n{index}"
+
+
+def test_repair_index_drops_a_restyled_stale_line(tmp_path):
+    """Stale detection must parse entries the same tolerant way the "already
+    listed" check does, or a restyled line for a deleted file is never dropped
+    and the index goes on listing a file that is not there."""
+    ltm, cfg = make_ltm(tmp_path)
+    (cfg.ltm_dir / "MEMORY.md").write_text(
+        "# Memory Index\n- [ gone.md ] — restyled and deleted\n", encoding="utf-8")
+
+    ltm._repair_index()
+
+    assert "gone.md" not in ltm.read_index()
+
+
+def test_repair_index_never_loses_the_header_or_prose(tmp_path):
+    """Only entry lines are candidates for removal: the header, a note, and the
+    empty placeholder must not be swept away along with the stale entries."""
+    ltm, cfg = make_ltm(tmp_path)
+    (cfg.ltm_dir / "MEMORY.md").write_text(
+        "# Memory Index\n\nEverything memkit knows.\n- [gone.md] — stale\n",
+        encoding="utf-8")
+
+    ltm._repair_index()
+    index = ltm.read_index()
+
+    assert "# Memory Index" in index
+    assert "Everything memkit knows." in index
+    assert "gone.md" not in index
+    assert index.endswith("\n") and not index.endswith("\n\n")

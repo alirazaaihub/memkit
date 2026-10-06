@@ -118,6 +118,81 @@ def test_close_uses_atexit_timeout_default():
     release.set()
 
 
+def test_inline_job_does_not_overlap_the_worker_thread():
+    """The bug: an inline job (queue saturated, or closed) ran the handler
+    directly on the caller thread with no lock, so it could execute
+    CONCURRENTLY with the job in flight on the worker thread — two writers
+    interleaving on the same ltm/ files. Both paths must take the handler
+    lock, so an inline run waits for the in-flight job to finish."""
+    inside = threading.Event()      # worker is inside the handler
+    release = threading.Event()     # ...and stays there until we let it go
+    overlap = []
+
+    def handler(job):
+        if job == ("slow",):
+            inside.set()
+            release.wait(5)
+            return
+        if inside.is_set() and not release.is_set():
+            overlap.append(job)     # ran while ("slow",) was still executing
+
+    w = MemoryWorker(handler, logger=_NullLogger(), atexit_timeout=5.0)
+    w.submit(("slow",))
+    assert inside.wait(5), "the worker never entered the slow job"
+
+    # Saturate the queue so this submit takes the inline path while the worker
+    # is still inside the slow job.
+    for i in range(1001):
+        w._queue.put((("filler", i), None))
+
+    ran = threading.Thread(target=lambda: w.submit(("inline", 9)))
+    ran.start()
+    time.sleep(0.2)                 # plenty of time to run, if it were unlocked
+    assert ran.is_alive(), "inline job did not wait for the in-flight job"
+    assert overlap == [], "inline job ran concurrently with the worker's job"
+
+    # Take the filler jobs back out: the worker is blocked inside the slow job
+    # (never in get()), so nothing else can consume them. Without this the
+    # worker would chew through 1001 fillers after release and close() would
+    # join a busy thread forever.
+    for _ in range(1001):
+        w._queue.get_nowait()
+    release.set()
+    ran.join(5)
+    w.close(timeout=5.0)
+
+
+def test_atexit_shutdown_drains_queued_jobs_before_stopping():
+    """The bug: atexit put the SENTINEL first, so the worker thread exited the
+    moment it saw it and every queued extraction was silently discarded — at
+    exactly the moment (the user forgot close()) they were the only thing left
+    to save. atexit must flush first, then stop."""
+    release = threading.Event()
+    jobs = []
+    lock = threading.Lock()
+
+    def handler(job):
+        if job == ("slow",):
+            release.wait(5)
+        with lock:
+            jobs.append(job)
+
+    w = MemoryWorker(handler, logger=_NullLogger(), atexit_timeout=5.0)
+    w.submit(("slow",))
+    time.sleep(0.1)                 # let the worker pick the slow job up
+    w.submit(("queued-during-shutdown",))   # must still be processed
+
+    threading.Thread(target=w._atexit_shutdown).start()
+    time.sleep(0.2)                 # atexit is now blocked in flush()
+    release.set()                   # let the worker reach the queued job
+
+    deadline = time.time() + 5
+    while ("queued-during-shutdown",) not in jobs and time.time() < deadline:
+        time.sleep(0.02)
+    assert ("queued-during-shutdown",) in jobs, (
+        f"atexit discarded a queued job: {jobs}")
+
+
 def test_handler_exception_does_not_kill_worker():
     boom_seen = []
 

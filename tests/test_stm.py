@@ -223,6 +223,83 @@ def test_on_archive_hook_fires_with_text(tmp_path):
     assert text.startswith("[4]"), f"expected numbered transcript text, got {text[:20]!r}"
 
 
+# -- the running token total (O(1) budget check) ---------------------------------
+
+def test_running_token_total_stays_exact_across_adds_and_a_commit(tmp_path):
+    """The bug: ``_ensure_budget`` re-counted the whole window on every single
+    ``add()`` — O(window) per turn. It now reads an incremental running total,
+    which is only correct if that total is re-derived (never decremented) when
+    a summarization drops the compressed prefix."""
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\ncompressed"])
+    for i in range(40):
+        stm.add("user", f"turn {i} " + "x" * 30)
+    settle(stm)
+    assert stm.has_summary()
+    assert stm._turns_tokens == stm.counter.count_messages(stm.turns), \
+        "total drifted from the real window right after a commit"
+
+    for i in range(10):
+        stm.add("assistant", f"after {i} " + "y" * 20)
+    assert stm._turns_tokens == stm.counter.count_messages(stm.turns)
+
+
+def test_token_count_does_not_trust_a_drifted_running_total(tmp_path):
+    """A caller who mutates ``turns`` directly bypasses the incremental path.
+    ``token_count()`` is the public measurement, so it must re-sync the running
+    total rather than reporting (and then reusing) the stale one."""
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\nx"], max_tokens=10_000)
+    stm.add("user", "hello")
+    real = stm.counter.count_messages(stm.turns)
+
+    stm.turns.append({"role": "user", "content": "sneaked in behind the lock"})
+    assert stm.token_count() == stm.counter.count_messages(stm.turns)
+    assert stm._turns_tokens == stm.counter.count_messages(stm.turns) != real
+
+
+# -- unarchived_transcript: the session-end delta --------------------------------
+
+def test_unarchived_transcript_is_the_whole_window_before_any_archive(tmp_path):
+    """With nothing archived yet, the delta is the entire window, in order."""
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\nnever runs"],
+                               max_tokens=10_000)
+    stm.add("user", "first")
+    stm.add("assistant", "second")
+
+    out = stm.unarchived_transcript()
+    assert "user: first" in out and "assistant: second" in out
+    assert out.index("first") < out.index("second")
+
+
+def test_unarchived_transcript_returns_only_the_delta(tmp_path):
+    """The bug: at session end the whole window was re-extracted, so every span
+    the summarizer had already archived (and fed to extraction via on_archive)
+    was sent to the LTM a second time. Only the turns the transcript has not
+    received may come back — and their ``[n]`` markers must be the true line
+    numbers they will get when they are finally written."""
+    stm, cfg, calls = make_stm(tmp_path, ["## Chronology\ncompressed"])
+    for i in range(40):
+        stm.add("user", f"old turn {i} " + "x" * 30)
+    settle(stm)
+    assert stm.has_summary()
+
+    # Whatever the summarizer did not get to is the delta — and turn 0, which it
+    # definitely archived, must never be in it.
+    delta_after_archive = stm.unarchived_transcript()
+    assert "old turn 0" not in delta_after_archive, \
+        "already-archived text came back for re-extraction"
+
+    stm.add("user", "the fresh marker 77777")
+    out = stm.unarchived_transcript()
+
+    assert "the fresh marker 77777" in out
+    assert "old turn 0" not in out, "already-archived text leaked into the delta"
+    # the markers continue the file's true line numbers: the first delta line is
+    # the line right after the last one on disk, and they run consecutively from
+    # there (so read_memory_file(offset=n-1) still lands on the right line)
+    markers = [int(l[1:l.index("]")]) for l in out.splitlines()]
+    assert markers == list(range(stm._lines + 1, stm._lines + 1 + len(markers)))
+
+
 # -- window behavior (unchanged semantics) -------------------------------------
 
 def test_trailing_pending_tool_call_stays_verbatim(tmp_path):
@@ -438,6 +515,43 @@ def test_wait_until_settled_timeout(tmp_path):
 
     release.set()
     settle(stm)
+
+
+# -- close(): never freeze a window mid-pass ------------------------------------
+
+def test_close_waits_for_a_pass_that_outlives_its_timeout(tmp_path):
+    """The bug: ``close`` joined with a bounded timeout, so a pass still
+    committing when the timeout fired left the thread running. ``_finalize``
+    then read the window (turns the commit was about to drop) and cleared it —
+    and the late commit rewrote the window, silently dropping the newest turns
+    from the live context. ``close`` must not return until the commit landed."""
+    entered = threading.Event()     # the summarizer is inside its LLM call
+    release = threading.Event()     # ...and is let go only after close() began
+
+    stm, cfg, _ = make_stm(tmp_path, [])
+
+    def slow_llm(messages):
+        entered.set()
+        release.wait(10)
+        return "## Chronology\ncompressed late"
+
+    cfg.llm = slow_llm
+
+    for i in range(40):
+        stm.add("user", f"turn {i} " + "x" * 30)
+    assert entered.wait(5), "summarization never started"
+    assert stm.turns, "test is void — the window was already empty"
+
+    closer = threading.Thread(target=lambda: stm.close(timeout=0.05))
+    closer.start()
+    time.sleep(0.3)                 # well past the 0.05s timeout
+    assert closer.is_alive(), "close gave up on a mid-pass summarizer"
+    release.set()
+    closer.join(10)
+    assert not closer.is_alive()
+
+    assert stm.has_summary(), "close returned before the commit landed"
+    assert stm._turns_tokens == stm.counter.count_messages(stm.turns)
 
 
 # -- forced compaction (/compact) -----------------------------------------------

@@ -317,6 +317,67 @@ def test_compact_folds_older_turns_into_the_summary(tmp_path):
     mem.close()
 
 
+# -- session identity / finalization --------------------------------------------
+
+def test_facade_generates_a_session_id_when_none_is_given(tmp_path):
+    """The facade's own default is ``session_id=None`` and it forwards that to
+    the config, so the None path is the DEFAULT path — it must generate an id
+    rather than raising ``session_id must be a simple directory/file name``."""
+    mem = Memory(tmp_path / "auto", llm=ScriptedLLM([]), max_tokens_stm=1000,
+                 max_tokens_ltm=1000, token_counter=CHARS)
+    assert mem.session_id, "no session id was generated"
+    assert mem.stm.transcript_rel == f"stm/{mem.session_id}.md"
+    mem.close()
+
+
+def test_session_end_extraction_does_not_repeat_archived_spans(tmp_path):
+    """The bug: ``_finalize`` re-extracted the WHOLE window, so every span the
+    summarizer had already archived (and handed to extraction via on_archive)
+    went to the LTM a second time — duplicate facts and duplicate LLM calls.
+    Only the never-archived tail may be extracted at session end."""
+    mem = make_memory(tmp_path)
+    archived_marker = "The old code word is MARMOT-3"
+    mem.add("user", archived_marker)
+    for i in range(60):
+        mem.add("assistant", f"chatter {i} " + "z" * 25)
+    assert mem.stm.wait_until_settled(10.0), "STM summarizer never settled"
+    assert mem.stm.has_summary(), "test is void — nothing was archived"
+
+    fresh_marker = "The new code word is OTTER-7"
+    mem.add("user", fresh_marker)
+
+    submits = []
+    real_submit = mem.worker.submit
+    mem.worker.submit = lambda job, *a, **kw: (submits.append(job), real_submit(job, *a, **kw))[1]
+
+    mem.close()
+
+    finals = [payload[1] for kind, payload in submits if kind == "extract"
+              and payload[0] == "End-of-session conversation"]
+    assert finals, "session end extracted nothing at all"
+    text = "\n".join(finals)
+    assert fresh_marker in text, "the never-archived tail was not extracted"
+    assert archived_marker not in text, \
+        "already-archived text was queued for extraction a second time"
+
+
+def test_budget_check_stops_once_finalized(tmp_path):
+    """The bug: after close(), a late ``add()`` still counted toward the
+    "every 16 adds, scan the whole LTM tree" trigger and could submit work to a
+    closed worker. A finalized memory must do no LTM maintenance at all."""
+    mem = make_memory(tmp_path)
+    mem.close()
+    submits = []
+    mem.worker.submit = lambda job, *a, **kw: submits.append(job)
+    mem.ltm.over_budget = lambda: True          # would trigger, if it ran
+
+    for _ in range(40):
+        mem._maybe_check_ltm_budget()
+
+    assert mem._adds_since_check == 0, "a finalized memory kept counting adds"
+    assert submits == [], f"a finalized memory submitted jobs: {submits}"
+
+
 def test_compact_feeds_ltm_extraction(tmp_path):
     """A forced summary archives the same text a cap-driven one would, so the
     LTM extraction job is queued automatically — no extra wiring."""

@@ -134,19 +134,41 @@ Budget: the total memory (index + topic files) may not exceed
 
 Procedure:
 1. list_memory_files, then read_memory_file ltm/MEMORY.md to see the index.
-2. read_memory_file the topic files involved (only those you actually need;
-   use search_memory_lines to find duplicates instead of re-reading
-   everything).
-3. Merge the new facts in. For each new fact decide: new topic file,
-   addition to an existing file, or an update/override of an existing line
-   (people change; when a newer fact contradicts an older one, keep the newer
-   and drop the older). Deduplicate near-identical lines.
-4. Apply the changes with the smallest tool that fits: edit_memory_file to
-   change or remove an existing line (copy its exact text), write_memory_file
-   only to create a new topic file or rewrite one whole — when you do, ALWAYS
-   pass the COMPLETE new content, not a patch. Delete a topic file only when
-   nothing in it remains true; never delete MEMORY.md.
-5. Update ltm/MEMORY.md last: one line per existing topic file in the form
+2. CHECK EXISTING MEMORIES FIRST, for EVERY new fact, before writing anything:
+   - Run search_memory_lines across ALL ltm/ files (do not pass file_path, and
+     do not limit yourself to the file the fact seems to belong to) using the
+     fact's subject and key terms, and also the OLD value if the fact is a
+     correction (e.g. a changed name, role, preference, number, or decision).
+   - read_memory_file the matching windows/files so you see the exact current
+     text of every line that mentions the same thing.
+3. Decide per fact, based on what step 2 found:
+   a. EXISTING LINE FOUND, new fact contradicts / corrects / updates it
+      (people change their name, opinions, tools, numbers): do NOT add a new
+      line next to it. Call edit_memory_file on that exact line (copy its
+      exact text) and REPLACE it with the new fact and today's date. Do this
+      in EVERY file where the outdated statement appears. The old value must
+      not survive anywhere in ltm/.
+   b. EXISTING LINE FOUND, new fact says the same thing: leave it alone (or
+      refresh its date with edit_memory_file). Never create a duplicate.
+   c. EXISTING LINE FOUND, but the old line is now false and has no
+      replacement (e.g. "likes X" became "dislikes X"): replace it with the
+      single current truth. Never keep both sides of a contradiction.
+   d. NO related line exists anywhere: only then write it as a NEW memory,
+      appended to the right topic file (edit_memory_file to add into an
+      existing file, or write_memory_file with the COMPLETE content to create
+      a new topic file).
+   Replace, don't annotate: do not write history such as "(corrected from
+   ...)", "(previously ...)" or "(contradicts earlier note)". Memory holds only
+   what is true now.
+4. Apply changes with the smallest tool that fits: edit_memory_file to change
+   or remove an existing line, write_memory_file only to create a new topic
+   file or rewrite one whole (ALWAYS pass the COMPLETE new content, not a
+   patch). Delete a topic file only when nothing in it remains true; never
+   delete MEMORY.md.
+5. VERIFY: after editing, run search_memory_lines again for the old value
+   (e.g. the old name). If any line still contains the outdated statement,
+   fix it too.
+6. Update ltm/MEMORY.md last: one line per existing topic file in the form
    `- [filename.md] — one-line hook telling when to read it`. The index must
    stay under {max_index_tokens} tokens — merge hooks or drop files from the
    index only if they no longer exist.
@@ -196,11 +218,22 @@ similar names. Use them for memory questions only.
 - list_memory_files() — lists every memory file you may read: this
   conversation's transcript and the shared ltm/ memory tree."""
 
-_STM_FRAGMENT = """\
-## Short-term memory
+# The opening sentence must match reality: telling a model its earlier turns
+# "were compressed into the summary below" before any summarization has run
+# sends it looking for a summary that is not there, and invites it to answer
+# from a lossy summary instead of the verbatim window it actually has.
+_STM_PREAMBLE_SUMMARIZED = """\
 Your earlier conversation was compressed into the summary below. The complete,
 verbatim text of this whole conversation — every turn, including your own past
-replies — is kept in this one transcript file:
+replies — is kept in this one transcript file:"""
+
+_STM_PREAMBLE_LIVE = """\
+The full conversation so far is in your context. Its complete, verbatim text is
+also being written, turn by turn, to this transcript file:"""
+
+_STM_FRAGMENT = """\
+## Short-term memory
+{preamble}
 
 {transcript_path}
 
@@ -250,8 +283,12 @@ def system_prompt_fragment(
         "",
         _TOOLS_FRAGMENT,
     ]
-    if has_summary or transcript_path:
-        parts += ["", _STM_FRAGMENT.format(transcript_path=transcript_path)]
+    if transcript_path:
+        parts += ["", _STM_FRAGMENT.format(
+            preamble=(_STM_PREAMBLE_SUMMARIZED if has_summary
+                      else _STM_PREAMBLE_LIVE),
+            transcript_path=transcript_path,
+        )]
     parts += ["", _LTM_FRAGMENT.format(
         memory_md=memory_md.strip() or "MEMORY.md is currently empty."
     )]
