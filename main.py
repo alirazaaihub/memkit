@@ -42,15 +42,28 @@ client = OpenAI(base_url=env["TOKENHARBOR_BASE_URL"], api_key=env["TOKENHARBOR_A
 llm = OpenAILLM(model=env["TOKENHARBOR_MODEL"], client=client, max_tokens=1024)
 
 # ---- 2. memory: one object, both kinds -------------------------------------
-mem = Memory(
-    "./demo_memory",                 # root; each user's whole memory set lives in demo_memory/<user_id>/
-    llm=llm,                         # used for summarizing + extracting (llm.with_tools auto-detected)
-    max_tokens_stm=2000,             # your caps — when STM fills, it archives + summarizes
-    max_tokens_ltm=300,             # when LTM fills, the consolidation agent tidies the tree
-    max_summary_tokens=300,          # cap the rolling summary itself (omit to derive from STM)
-    user_id=USER_ID,                 # per-user memory folder: change it to switch memories
-    atexit_timeout=120,              # let slow end-of-session extraction finish
-)
+# The caps live here, once, so the startup Memory and the 'reset' Memory can
+# never drift apart. Tune them in one place.
+MEMORY_DIR = "./demo_memory"
+MAX_TOKENS_STM = 3000      # when STM fills, it archives + summarizes
+MAX_TOKENS_LTM = 6000      # when LTM fills, the consolidation agent tidies the tree
+MAX_SUMMARY_TOKENS = 1000  # cap the rolling summary itself
+
+
+def build_memory() -> Memory:
+    """A fresh Memory over the same user's memory set, with the same caps."""
+    return Memory(
+        MEMORY_DIR,                # root; each user's memory set lives in demo_memory/<user_id>/
+        llm=llm,                   # used for summarizing + extracting (llm.with_tools auto-detected)
+        max_tokens_stm=MAX_TOKENS_STM,
+        max_tokens_ltm=MAX_TOKENS_LTM,
+        max_summary_tokens=MAX_SUMMARY_TOKENS,
+        user_id=USER_ID,           # per-user memory folder: change it to switch memories
+        atexit_timeout=120,        # let slow end-of-session extraction finish
+    )
+
+
+mem = build_memory()
 try:  # Windows console sometimes can't print em-dashes / unicode replies
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -99,9 +112,7 @@ while True:
         break
     if text.lower() == "reset":
         mem.close()  # flush this session's memories
-        mem = Memory("./demo_memory", llm=llm, max_tokens_stm=3000,
-                     max_tokens_ltm=6000, max_summary_tokens=1000,
-                     user_id=USER_ID, atexit_timeout=120)
+        mem = build_memory()  # same caps — a fresh STM window, LTM kept
         print("bot> (fresh short-term window; long-term memory kept)\n")
         continue
     print("bot> " + agent_turn(text) + "\n")

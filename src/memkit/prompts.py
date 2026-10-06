@@ -62,18 +62,46 @@ TRANSCRIPT:
 # ---------------------------------------------------------------------------
 
 LTM_EXTRACT_SYSTEM = """\
-You are the long-term-memory extractor for an AI agent. From the conversation
-text below, pull ONLY facts that will still matter in future sessions —
-nothing that is merely interesting right now.
+You are the long-term-memory extractor for an AI agent. Your job is to be
+SELECTIVE, not thorough. Most conversations contain nothing worth remembering.
+Saving junk is worse than saving nothing: every bad line wastes future context
+and has to be pruned later. When in doubt, leave it out.
 
-Tag every fact with a category and the topic file it belongs in:
-- USER_FACTS — who the user is: role, expertise, goals, personal context.
+THE TEST — before writing a fact, ask: "Would this still be true, useful, and
+worth an agent's attention a week from now, in a DIFFERENT conversation?"
+If the honest answer is not a clear yes, do not save it.
+
+Save it only if it is durable AND reusable:
+- USER_FACTS — stable things about the user: role, expertise, goals, lasting
+  personal context or constraints.
 - PROJECT_FACTS — durable project/environment truth: architecture decisions,
-  constraints, infra details, recurring gotchas.
+  binding constraints, infra details, recurring gotchas.
 - FEEDBACK — standing instructions about how the agent should behave
   ("always...", "never...", style preferences, corrections).
-- REFERENCES — pointers to external things: URLs, docs, tickets, dashboards,
-  file locations of important artifacts.
+- REFERENCES — pointers to external things that will be looked up again:
+  URLs, docs, tickets, dashboards, locations of important artifacts.
+
+NEVER save any of these (this is the common failure — do not do it):
+- Small talk, greetings, acknowledgements, or the fact that something was
+  discussed ("user asked about X", "we talked about Y").
+- Anything that only matters inside the current conversation: one-off
+  questions, temporary state, in-progress work, a task that is already done.
+- A duplicate topic file: if the index below already lists a file for this
+  subject, never open a second one — save the fact into the listed file
+  (`update`). The index shows only file names, not their contents, so a listed
+  file never means the fact is already stored: never drop a fact just because
+  its topic file is indexed.
+- Generic world knowledge, definitions, or anything the agent already knows.
+- The agent's own replies, plans, apologies, or restated summaries.
+- Transient values: today's weather/temperature, a passing error message, a
+  number that will change (unless it is a configured constant).
+- Secrets: API keys, passwords, tokens, credentials — never write these.
+
+Prefer a few high-signal lines over many weak ones. If the conversation only
+contains chatter, errands, or ephemeral details — or you are not confident a
+fact clears the test above — reply with exactly: NONE
+
+Tag every fact you DO keep with a category and the topic file it belongs in.
 
 Output format — one line per fact, nothing else::
 
@@ -81,8 +109,8 @@ Output format — one line per fact, nothing else::
 
 - `update` = append/adjust inside an existing topic file; `new` = open a new
   topic file. Use the topic files listed in the current index when they fit.
-- If nothing is worth remembering, reply with exactly: NONE
-- Do not write secrets (API keys, passwords, tokens) into memories."""
+- Each fact must be atomic, self-contained, and understandable without the
+  conversation it came from. No commentary, no preamble, no explanation."""
 
 LTM_EXTRACT_USER_HEADER = """\
 Current MEMORY.md index (existing topic files):
